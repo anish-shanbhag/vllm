@@ -676,6 +676,11 @@ class GPUModelRunner(
             dtype=np.int64,
         )
 
+        # OPTIMIZATION: Pre-allocate arrays for the uniform-decode fast path.
+        # When every request decodes exactly 1 token, we can skip expensive
+        # np.repeat / np.cumsum / arange computations.
+        self._ones_np = np.ones(self.max_num_reqs, dtype=np.int32)
+
         # Layer pairings for cross-layer KV sharing.
         # If an Attention layer `layer_name` is in the keys of this dict, it
         # means this layer will perform attention using the keys and values
@@ -986,22 +991,29 @@ class GPUModelRunner(
         # or running requests that are not scheduled in this step. We remove
         # them from the persistent batch but keep their cached states since
         # they will be scheduled again sometime in the future.
-        scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
-        cached_req_ids = self.input_batch.req_id_to_index.keys()
+        # OPTIMIZATION: Skip the expensive set difference when there are no
+        # finished requests, no new requests, and no resumed requests -- in
+        # that case the scheduled set is identical to the cached set and the
+        # unscheduled set is guaranteed to be empty.
         resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
-        # NOTE(zhuohan): cached_req_ids and resumed_req_ids are usually disjoint,
-        # so `(scheduled_req_ids - resumed_req_ids) == scheduled_req_ids` holds
-        # apart from the forced-preemption case in reset_prefix_cache. And in
-        # that case we include the resumed_req_ids in the unscheduled set so
-        # that they get cleared from the persistent batch before being re-scheduled
-        # in the normal resumed request path.
-        unscheduled_req_ids = cached_req_ids - (scheduled_req_ids - resumed_req_ids)
-        # NOTE(woosuk): The persistent batch optimization assumes that
-        # consecutive batches contain mostly the same requests. If batches
-        # have low request overlap (e.g., alternating between two distinct
-        # sets of requests), this optimization becomes very inefficient.
-        for req_id in unscheduled_req_ids:
-            self.input_batch.remove_request(req_id)
+        if (scheduler_output.finished_req_ids
+                or scheduler_output.scheduled_new_reqs
+                or resumed_req_ids):
+            scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
+            cached_req_ids = self.input_batch.req_id_to_index.keys()
+            # NOTE(zhuohan): cached_req_ids and resumed_req_ids are usually disjoint,
+            # so `(scheduled_req_ids - resumed_req_ids) == scheduled_req_ids` holds
+            # apart from the forced-preemption case in reset_prefix_cache. And in
+            # that case we include the resumed_req_ids in the unscheduled set so
+            # that they get cleared from the persistent batch before being re-scheduled
+            # in the normal resumed request path.
+            unscheduled_req_ids = cached_req_ids - (scheduled_req_ids - resumed_req_ids)
+            # NOTE(woosuk): The persistent batch optimization assumes that
+            # consecutive batches contain mostly the same requests. If batches
+            # have low request overlap (e.g., alternating between two distinct
+            # sets of requests), this optimization becomes very inefficient.
+            for req_id in unscheduled_req_ids:
+                self.input_batch.remove_request(req_id)
 
         reqs_to_add: list[CachedRequestState] = []
         # Add new requests to the cached states.
@@ -1563,148 +1575,230 @@ class GPUModelRunner(
         # This way, we can overlap the copy with the following CPU operations.
         self.input_batch.block_table.commit_block_table(num_reqs)
 
-        # Get request indices.
-        # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
-        req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
+        # ---- Fast path for uniform decode (all requests decode 1 token) ----
+        # When total_num_scheduled_tokens == num_reqs, every request has
+        # exactly 1 token scheduled.  This is the common steady-state case
+        # during generation and we can avoid np.repeat, np.cumsum, etc.
+        is_pure_decode = (total_num_scheduled_tokens == num_reqs)
 
-        # cu_num_tokens: [2, 5, 3] -> [2, 7, 10]
-        # arange: [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
-        cu_num_tokens, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
+        if is_pure_decode:
+            # req_indices is just [0, 1, 2, ..., num_reqs-1]
+            req_indices = self.arange_np[:num_reqs]
 
-        # Get positions.
-        positions_np = self.positions.np[:total_num_scheduled_tokens]
-        np.add(
-            self.input_batch.num_computed_tokens_cpu[req_indices],
-            arange,
-            out=positions_np,
-        )
+            # positions are just the current num_computed_tokens per request
+            num_computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+            positions_np = self.positions.np[:num_reqs]
+            positions_np[:] = num_computed
 
-        # Calculate M-RoPE positions.
-        # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
-        if self.uses_mrope:
-            self._calc_mrope_positions(scheduler_output)
+            # token_indices: position + req_index * row_stride
+            stride = self.input_batch.token_ids_cpu.shape[1]
+            token_indices = positions_np + req_indices * stride
+            token_indices_tensor = torch.from_numpy(token_indices)
 
-        # Calculate XD-RoPE positions.
-        # Only relevant for models using XD-RoPE (e.g, HunYuan-VL)
-        if self.uses_xdrope_dim > 0:
-            self._calc_xdrope_positions(scheduler_output)
-
-        # Get token indices.
-        # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
-        # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
-        # where M is the max_model_len.
-        token_indices = (
-            positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]
-        )
-        token_indices_tensor = torch.from_numpy(token_indices)
-
-        # NOTE(woosuk): We use torch.index_select instead of np.take here
-        # because torch.index_select is much faster than np.take for large
-        # tensors.
-        torch.index_select(
-            self.input_batch.token_ids_cpu_tensor.flatten(),
-            0,
-            token_indices_tensor,
-            out=self.input_ids.cpu[:total_num_scheduled_tokens],
-        )
-        if self.enable_prompt_embeds:
-            is_token_ids = self.input_batch.is_token_ids_tensor.flatten()
             torch.index_select(
-                is_token_ids,
+                self.input_batch.token_ids_cpu_tensor.flatten(),
                 0,
                 token_indices_tensor,
-                out=self.is_token_ids.cpu[:total_num_scheduled_tokens],
+                out=self.input_ids.cpu[:num_reqs],
+            )
+            if self.enable_prompt_embeds:
+                is_token_ids = self.input_batch.is_token_ids_tensor.flatten()
+                torch.index_select(
+                    is_token_ids,
+                    0,
+                    token_indices_tensor,
+                    out=self.is_token_ids.cpu[:num_reqs],
+                )
+
+            # No prompt embeds to fill during decode.
+
+            self.input_batch.block_table.compute_slot_mapping(
+                req_indices, positions_np)
+            self.input_batch.block_table.commit_slot_mapping(num_reqs)
+
+            # query_start_loc is just [0, 1, 2, ..., num_reqs]
+            self.query_start_loc.np[:num_reqs + 1] = (
+                self.arange_np[:num_reqs + 1])
+            # Pad the rest for cuda graph
+            self.query_start_loc.np[num_reqs + 1:].fill(num_reqs)
+            self.query_start_loc.copy_to_gpu()
+            query_start_loc = self.query_start_loc.gpu[:num_reqs + 1]
+
+            # seq_lens = num_computed_tokens + 1
+            self.seq_lens.np[:num_reqs] = num_computed + 1
+            self.seq_lens.np[num_reqs:].fill(0)
+            self.seq_lens.copy_to_gpu()
+
+            # In pure decode, all requests are past their prompt tokens,
+            # so discard_request_mask is all False (no discards).
+            self.discard_request_mask.np[:num_reqs] = False
+            self.discard_request_mask.copy_to_gpu(num_reqs)
+
+            # cu_num_tokens for _prepare_input_ids: [1, 2, ..., num_reqs]
+            cu_num_tokens = self.arange_np[1:num_reqs + 1]
+
+            self._prepare_input_ids(
+                scheduler_output,
+                num_reqs,
+                cu_num_tokens,
             )
 
-        # Because we did not pre-allocate a massive prompt_embeds CPU tensor on
-        # the InputBatch, we need to fill in the prompt embeds into the expected
-        # spots in the GpuModelRunner's pre-allocated prompt_embeds tensor.
-        if self.input_batch.req_prompt_embeds:
-            output_idx = 0
-            for req_idx in range(num_reqs):
-                num_sched = num_scheduled_tokens[req_idx]
+            # Common case: 1D positions (no M-RoPE / XD-RoPE for MoE models)
+            if self.uses_mrope:
+                self._calc_mrope_positions(scheduler_output)
+                self.mrope_positions.gpu[:, :num_reqs].copy_(
+                    self.mrope_positions.cpu[:, :num_reqs],
+                    non_blocking=True,
+                )
+            elif self.uses_xdrope_dim > 0:
+                self._calc_xdrope_positions(scheduler_output)
+                self.xdrope_positions.gpu[:, :num_reqs].copy_(
+                    self.xdrope_positions.cpu[:, :num_reqs],
+                    non_blocking=True,
+                )
+            else:
+                self.positions.copy_to_gpu(num_reqs)
 
-                # Skip if this request doesn't have embeddings
-                if req_idx not in self.input_batch.req_prompt_embeds:
-                    output_idx += num_sched
-                    continue
-
-                # Skip if no tokens scheduled
-                if num_sched <= 0:
-                    output_idx += num_sched
-                    continue
-
-                req_embeds = self.input_batch.req_prompt_embeds[req_idx]
-                start_pos = self.input_batch.num_computed_tokens_cpu[req_idx]
-
-                # Skip if trying to read beyond available embeddings
-                if start_pos >= req_embeds.shape[0]:
-                    output_idx += num_sched
-                    continue
-
-                # Copy available embeddings
-                end_pos = start_pos + num_sched
-                actual_end = min(end_pos, req_embeds.shape[0])
-                actual_num_sched = actual_end - start_pos
-
-                if actual_num_sched > 0:
-                    self.inputs_embeds.cpu[
-                        output_idx : output_idx + actual_num_sched
-                    ].copy_(req_embeds[start_pos:actual_end])
-
-                output_idx += num_sched
-
-        self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
-        self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
-
-        # Prepare the attention metadata.
-        self.query_start_loc.np[0] = 0
-        self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
-        # Note: pad query_start_loc to be non-decreasing, as kernels
-        # like FlashAttention requires that
-        self.query_start_loc.np[num_reqs + 1 :].fill(cu_num_tokens[-1])
-        self.query_start_loc.copy_to_gpu()
-        query_start_loc = self.query_start_loc.gpu[: num_reqs + 1]
-
-        self.seq_lens.np[:num_reqs] = (
-            self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens
-        )
-        # Fill unused with 0 for full cuda graph mode.
-        self.seq_lens.np[num_reqs:].fill(0)
-        self.seq_lens.copy_to_gpu()
-
-        num_tokens = [self.requests[r].num_tokens for r in self.input_batch.req_ids]
-        num_tokens_np = np.array(num_tokens, dtype=np.int32)
-
-        # Record which requests should not be sampled,
-        # so that we could clear the sampled tokens before returning
-        self.discard_request_mask.np[:num_reqs] = (
-            self.seq_lens.np[:num_reqs] < num_tokens_np
-        )
-        self.discard_request_mask.copy_to_gpu(num_reqs)
-
-        # Copy the tensors to the GPU.
-        self._prepare_input_ids(
-            scheduler_output,
-            total_num_scheduled_tokens,
-            cu_num_tokens,
-        )
-
-        if self.uses_mrope:
-            # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
-            self.mrope_positions.gpu[:, :total_num_scheduled_tokens].copy_(
-                self.mrope_positions.cpu[:, :total_num_scheduled_tokens],
-                non_blocking=True,
-            )
-        elif self.uses_xdrope_dim > 0:
-            # Only relevant for models using XD-RoPE (e.g, HunYuan-VL)
-            self.xdrope_positions.gpu[:, :total_num_scheduled_tokens].copy_(
-                self.xdrope_positions.cpu[:, :total_num_scheduled_tokens],
-                non_blocking=True,
-            )
         else:
-            # Common case (1D positions)
-            self.positions.copy_to_gpu(total_num_scheduled_tokens)
+            # ---- Original path for mixed prefill/decode batches ----
+            # Get request indices.
+            # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
+            req_indices = np.repeat(
+                self.arange_np[:num_reqs], num_scheduled_tokens)
+
+            # cu_num_tokens: [2, 5, 3] -> [2, 7, 10]
+            # arange: [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+            cu_num_tokens, arange = self._get_cumsum_and_arange(
+                num_scheduled_tokens)
+
+            # Get positions.
+            positions_np = self.positions.np[:total_num_scheduled_tokens]
+            np.add(
+                self.input_batch.num_computed_tokens_cpu[req_indices],
+                arange,
+                out=positions_np,
+            )
+
+            # Calculate M-RoPE positions.
+            if self.uses_mrope:
+                self._calc_mrope_positions(scheduler_output)
+
+            # Calculate XD-RoPE positions.
+            if self.uses_xdrope_dim > 0:
+                self._calc_xdrope_positions(scheduler_output)
+
+            # Get token indices.
+            token_indices = (
+                positions_np
+                + req_indices * self.input_batch.token_ids_cpu.shape[1]
+            )
+            token_indices_tensor = torch.from_numpy(token_indices)
+
+            torch.index_select(
+                self.input_batch.token_ids_cpu_tensor.flatten(),
+                0,
+                token_indices_tensor,
+                out=self.input_ids.cpu[:total_num_scheduled_tokens],
+            )
+            if self.enable_prompt_embeds:
+                is_token_ids = self.input_batch.is_token_ids_tensor.flatten()
+                torch.index_select(
+                    is_token_ids,
+                    0,
+                    token_indices_tensor,
+                    out=self.is_token_ids.cpu[:total_num_scheduled_tokens],
+                )
+
+            # Fill prompt embeds for requests that have them.
+            if self.input_batch.req_prompt_embeds:
+                output_idx = 0
+                for req_idx in range(num_reqs):
+                    num_sched = num_scheduled_tokens[req_idx]
+
+                    if req_idx not in self.input_batch.req_prompt_embeds:
+                        output_idx += num_sched
+                        continue
+
+                    if num_sched <= 0:
+                        output_idx += num_sched
+                        continue
+
+                    req_embeds = self.input_batch.req_prompt_embeds[req_idx]
+                    start_pos = (
+                        self.input_batch.num_computed_tokens_cpu[req_idx])
+
+                    if start_pos >= req_embeds.shape[0]:
+                        output_idx += num_sched
+                        continue
+
+                    end_pos = start_pos + num_sched
+                    actual_end = min(end_pos, req_embeds.shape[0])
+                    actual_num_sched = actual_end - start_pos
+
+                    if actual_num_sched > 0:
+                        self.inputs_embeds.cpu[
+                            output_idx:output_idx + actual_num_sched
+                        ].copy_(req_embeds[start_pos:actual_end])
+
+                    output_idx += num_sched
+
+            self.input_batch.block_table.compute_slot_mapping(
+                req_indices, positions_np)
+            self.input_batch.block_table.commit_slot_mapping(
+                total_num_scheduled_tokens)
+
+            # Prepare the attention metadata.
+            self.query_start_loc.np[0] = 0
+            self.query_start_loc.np[1:num_reqs + 1] = cu_num_tokens
+            # Note: pad query_start_loc to be non-decreasing
+            self.query_start_loc.np[num_reqs + 1:].fill(cu_num_tokens[-1])
+            self.query_start_loc.copy_to_gpu()
+            query_start_loc = self.query_start_loc.gpu[:num_reqs + 1]
+
+            self.seq_lens.np[:num_reqs] = (
+                self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                + num_scheduled_tokens
+            )
+            self.seq_lens.np[num_reqs:].fill(0)
+            self.seq_lens.copy_to_gpu()
+
+            num_tokens = [
+                self.requests[r].num_tokens
+                for r in self.input_batch.req_ids
+            ]
+            num_tokens_np = np.array(num_tokens, dtype=np.int32)
+
+            self.discard_request_mask.np[:num_reqs] = (
+                self.seq_lens.np[:num_reqs] < num_tokens_np
+            )
+            self.discard_request_mask.copy_to_gpu(num_reqs)
+
+            self._prepare_input_ids(
+                scheduler_output,
+                total_num_scheduled_tokens,
+                cu_num_tokens,
+            )
+
+            if self.uses_mrope:
+                self.mrope_positions.gpu[
+                    :, :total_num_scheduled_tokens
+                ].copy_(
+                    self.mrope_positions.cpu[
+                        :, :total_num_scheduled_tokens
+                    ],
+                    non_blocking=True,
+                )
+            elif self.uses_xdrope_dim > 0:
+                self.xdrope_positions.gpu[
+                    :, :total_num_scheduled_tokens
+                ].copy_(
+                    self.xdrope_positions.cpu[
+                        :, :total_num_scheduled_tokens
+                    ],
+                    non_blocking=True,
+                )
+            else:
+                self.positions.copy_to_gpu(total_num_scheduled_tokens)
 
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
         if not use_spec_decode:
@@ -3470,10 +3564,22 @@ class GPUModelRunner(
 
             num_reqs = self.input_batch.num_reqs
             req_ids = self.input_batch.req_ids
-            tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
-            num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
-            max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+
+            # OPTIMIZATION: When every request decodes exactly 1 token
+            # (the common steady-state case), skip the dict lookup + list
+            # comprehension + np.array construction and reuse a cached
+            # ones array instead.
+            if num_tokens_unpadded == num_reqs:
+                # Pure decode: all requests scheduled exactly 1 token.
+                num_scheduled_tokens_np = self._ones_np[:num_reqs]
+                max_num_scheduled_tokens = 1
+            else:
+                tokens = [
+                    scheduler_output.num_scheduled_tokens[i] for i in req_ids
+                ]
+                num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
+                max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
 
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,
