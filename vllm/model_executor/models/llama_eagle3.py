@@ -271,8 +271,15 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
         if getattr(self.config, "draft_vocab_size", None) is None:
             base_vocab_size = getattr(self.config, "vocab_size", None)
             self.config.draft_vocab_size = base_vocab_size
-        target_layer_num = vllm_config.model_config.get_num_layers(
-            vllm_config.parallel_config
+        # vllm_config here is the DRAFT's config (created via
+        # create_vllm_config_for_draft_model), so vllm_config.model_config refers
+        # to the draft's model (num_hidden_layers=1).  To get the TARGET model's
+        # layer count — needed as start_layer_id so the draft's layers don't
+        # collide with target layer names like "model.layers.1" — reach through
+        # speculative_config to the preserved target_model_config.
+        spec_cfg = vllm_config.speculative_config
+        target_layer_num = spec_cfg.target_model_config.get_num_layers(
+            spec_cfg.target_parallel_config
         )
 
         # Store target layer count in draft config for
