@@ -48,6 +48,13 @@ class TrtLlmNvFp4ExpertsBase:
         self.local_num_experts = moe_config.num_local_experts
         self.ep_rank = moe_config.moe_parallel_config.ep_rank
 
+        from vllm.config import get_current_vllm_config
+        try:
+            cc = get_current_vllm_config().compilation_config
+            self._max_cudagraph_capture_size = cc.max_cudagraph_capture_size or 512
+        except AssertionError:
+            self._max_cudagraph_capture_size = 512
+
         assert self.quant_config.g1_alphas is not None
         assert self.quant_config.a2_gscale is not None
         if moe_config.is_act_and_mul:
@@ -294,8 +301,6 @@ class TrtLlmNvFp4ExpertsMonolithic(
         )
 
         # Invoke kernel.
-        from vllm.config import get_current_vllm_config
-        max_cap = get_current_vllm_config().compilation_config.max_cudagraph_capture_size
         return flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
             routing_logits=router_logits,
             routing_bias=routing_bias,
@@ -326,5 +331,5 @@ class TrtLlmNvFp4ExpertsMonolithic(
             routing_method_type=self.routing_method_type,
             do_finalize=True,
             activation_type=activation_to_flashinfer_int(activation),
-            tune_max_num_tokens=max(max_cap or 512, 1),
+            tune_max_num_tokens=max(self._max_cudagraph_capture_size, 1),
         )[0]
