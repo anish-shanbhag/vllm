@@ -419,6 +419,7 @@ class MiniMaxM2Model(nn.Module):
             if spec_layer is not None:
                 continue  # skip spec decode layers for main model
 
+            original_name = name
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
@@ -434,6 +435,10 @@ class MiniMaxM2Model(nn.Module):
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
+                    continue
+
+                if name not in params_dict:
+                    name = original_name
                     continue
 
                 if is_pp_missing_parameter(name, self):
