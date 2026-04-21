@@ -991,29 +991,22 @@ class GPUModelRunner(
         # or running requests that are not scheduled in this step. We remove
         # them from the persistent batch but keep their cached states since
         # they will be scheduled again sometime in the future.
-        # OPTIMIZATION: Skip the expensive set difference when there are no
-        # finished requests, no new requests, and no resumed requests -- in
-        # that case the scheduled set is identical to the cached set and the
-        # unscheduled set is guaranteed to be empty.
+        scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
+        cached_req_ids = self.input_batch.req_id_to_index.keys()
         resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
-        if (scheduler_output.finished_req_ids
-                or scheduler_output.scheduled_new_reqs
-                or resumed_req_ids):
-            scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
-            cached_req_ids = self.input_batch.req_id_to_index.keys()
-            # NOTE(zhuohan): cached_req_ids and resumed_req_ids are usually disjoint,
-            # so `(scheduled_req_ids - resumed_req_ids) == scheduled_req_ids` holds
-            # apart from the forced-preemption case in reset_prefix_cache. And in
-            # that case we include the resumed_req_ids in the unscheduled set so
-            # that they get cleared from the persistent batch before being re-scheduled
-            # in the normal resumed request path.
-            unscheduled_req_ids = cached_req_ids - (scheduled_req_ids - resumed_req_ids)
-            # NOTE(woosuk): The persistent batch optimization assumes that
-            # consecutive batches contain mostly the same requests. If batches
-            # have low request overlap (e.g., alternating between two distinct
-            # sets of requests), this optimization becomes very inefficient.
-            for req_id in unscheduled_req_ids:
-                self.input_batch.remove_request(req_id)
+        # NOTE(zhuohan): cached_req_ids and resumed_req_ids are usually disjoint,
+        # so `(scheduled_req_ids - resumed_req_ids) == scheduled_req_ids` holds
+        # apart from the forced-preemption case in reset_prefix_cache. And in
+        # that case we include the resumed_req_ids in the unscheduled set so
+        # that they get cleared from the persistent batch before being re-scheduled
+        # in the normal resumed request path.
+        unscheduled_req_ids = cached_req_ids - (scheduled_req_ids - resumed_req_ids)
+        # NOTE(woosuk): The persistent batch optimization assumes that
+        # consecutive batches contain mostly the same requests. If batches
+        # have low request overlap (e.g., alternating between two distinct
+        # sets of requests), this optimization becomes very inefficient.
+        for req_id in unscheduled_req_ids:
+            self.input_batch.remove_request(req_id)
 
         reqs_to_add: list[CachedRequestState] = []
         # Add new requests to the cached states.
