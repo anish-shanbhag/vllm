@@ -86,18 +86,23 @@ class MiniMaxText01RMSNormTP(CustomOp):
         k: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         orig_dtype = q.dtype
-        q = q.to(torch.float32)
-        k = k.to(torch.float32)
-        q_var = q.pow(2).mean(dim=-1, keepdim=True)
-        k_var = k.pow(2).mean(dim=-1, keepdim=True)
+        q_fp32 = q.to(torch.float32)
+        k_fp32 = k.to(torch.float32)
+        q_var = q_fp32.pow(2).mean(dim=-1, keepdim=True)
+        k_var = k_fp32.pow(2).mean(dim=-1, keepdim=True)
         if q_norm.tp_world > 1:
-            qk_var = torch.cat([q_var, k_var], dim=-1)
+            qk_var = torch.empty(
+                (q_var.shape[0], 2), device=q.device, dtype=torch.float32
+            )
+            qk_var[:, 0:1] = q_var
+            qk_var[:, 1:2] = k_var
             qk_var = tensor_model_parallel_all_reduce(qk_var) / q_norm.tp_world
-            q_var, k_var = qk_var.chunk(2, dim=-1)
-        q = q * torch.rsqrt(q_var + q_norm.variance_epsilon) * q_norm.weight
-        k = k * torch.rsqrt(k_var + k_norm.variance_epsilon) * k_norm.weight
-        q = q.to(orig_dtype)
-        k = k.to(orig_dtype)
+            q_var = qk_var[:, 0:1]
+            k_var = qk_var[:, 1:2]
+        q = (q_fp32 * torch.rsqrt(q_var + q_norm.variance_epsilon)
+             * q_norm.weight).to(orig_dtype)
+        k = (k_fp32 * torch.rsqrt(k_var + k_norm.variance_epsilon)
+             * k_norm.weight).to(orig_dtype)
         return q, k
 
 
