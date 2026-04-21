@@ -230,6 +230,8 @@ class FlashInferAllReduce:
             return False
 
         num_tokens, hidden_dim = input_tensor.shape
+        if hidden_dim % 4 != 0:
+            return False
         if not self.max_num_tokens:
             element_size = torch.tensor([], dtype=input_tensor.dtype).element_size()
             self.max_num_tokens = self.max_workspace_size // (hidden_dim * element_size)
