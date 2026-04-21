@@ -294,6 +294,8 @@ class TrtLlmNvFp4ExpertsMonolithic(
         )
 
         # Invoke kernel.
+        from vllm.config import get_current_vllm_config
+        max_cap = get_current_vllm_config().compilation_config.max_cudagraph_capture_size
         return flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
             routing_logits=router_logits,
             routing_bias=routing_bias,
@@ -324,4 +326,5 @@ class TrtLlmNvFp4ExpertsMonolithic(
             routing_method_type=self.routing_method_type,
             do_finalize=True,
             activation_type=activation_to_flashinfer_int(activation),
+            tune_max_num_tokens=max(max_cap or 512, 1),
         )[0]
