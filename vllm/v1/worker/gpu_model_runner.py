@@ -918,9 +918,6 @@ class GPUModelRunner(
             return
 
         if self.reorder_batch_threshold is not None:
-            if (scheduler_output.total_num_scheduled_tokens
-                    == self.input_batch.num_reqs):
-                return
             reorder_batch_to_split_decodes_and_prefills(
                 self.input_batch,
                 scheduler_output,
@@ -997,8 +994,17 @@ class GPUModelRunner(
         scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
         cached_req_ids = self.input_batch.req_id_to_index.keys()
         resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
-        unscheduled_req_ids = cached_req_ids - (
-            scheduled_req_ids - resumed_req_ids)
+        # NOTE(zhuohan): cached_req_ids and resumed_req_ids are usually disjoint,
+        # so `(scheduled_req_ids - resumed_req_ids) == scheduled_req_ids` holds
+        # apart from the forced-preemption case in reset_prefix_cache. And in
+        # that case we include the resumed_req_ids in the unscheduled set so
+        # that they get cleared from the persistent batch before being re-scheduled
+        # in the normal resumed request path.
+        unscheduled_req_ids = cached_req_ids - (scheduled_req_ids - resumed_req_ids)
+        # NOTE(woosuk): The persistent batch optimization assumes that
+        # consecutive batches contain mostly the same requests. If batches
+        # have low request overlap (e.g., alternating between two distinct
+        # sets of requests), this optimization becomes very inefficient.
         for req_id in unscheduled_req_ids:
             self.input_batch.remove_request(req_id)
 
@@ -2026,16 +2032,16 @@ class GPUModelRunner(
         # in the same group share the same metadata.
         spec_decode_common_attn_metadata = None
         for kv_cache_gid, kv_cache_group in enumerate(kv_cache_groups):
-            cm = cm_base if kv_cache_gid == 0 else copy(cm_base)
+            cm = copy(cm_base)  # shallow copy
 
-            if self._has_cross_attention:
-                cm.encoder_seq_lens, cm.encoder_seq_lens_cpu = \
-                    self._get_encoder_seq_lens(
-                        num_scheduled_tokens or {},
-                        kv_cache_group.kv_cache_spec,
-                        num_reqs_padded,
-                        for_cudagraph_capture=for_cudagraph_capture,
-                    )
+            # Basically only the encoder seq_lens, block_table and slot_mapping change
+            # for each kv_cache_group.
+            cm.encoder_seq_lens, cm.encoder_seq_lens_cpu = self._get_encoder_seq_lens(
+                num_scheduled_tokens or {},
+                kv_cache_group.kv_cache_spec,
+                num_reqs_padded,
+                for_cudagraph_capture=for_cudagraph_capture,
+            )
             if kv_cache_gid > 0:
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
@@ -3625,7 +3631,17 @@ class GPUModelRunner(
                 ubatch_slices_padded,
             )
 
-            has_separate_kv_update = self._has_separate_kv_update
+            # True if any attention backend handles KV cache update separately
+            # from forward() (i.e., forward_includes_kv_cache_update=False). When true,
+            # slot_mappings must use padded dimensions to match the key/value tensors.
+            has_separate_kv_update = not all(
+                all(
+                    g.backend.forward_includes_kv_cache_update
+                    for g in self.attn_groups[id]
+                )
+                for id, spec in enumerate(self.kv_cache_config.kv_cache_groups)
+                if not isinstance(spec.kv_cache_spec, EncoderOnlyAttentionSpec)
+            )
             pad_attn = cudagraph_mode == CUDAGraphMode.FULL
 
             if self.cache_config.mamba_cache_mode == "align":
@@ -5633,19 +5649,6 @@ class GPUModelRunner(
 
         for i, attn_backend_map in enumerate(attention_backend_maps):
             self.attn_groups.append(create_attn_groups(attn_backend_map, i))
-
-        self._has_separate_kv_update = not all(
-            all(
-                g.backend.forward_includes_kv_cache_update
-                for g in self.attn_groups[id]
-            )
-            for id, spec in enumerate(kv_cache_config.kv_cache_groups)
-            if not isinstance(spec.kv_cache_spec, EncoderOnlyAttentionSpec)
-        )
-        self._has_cross_attention = any(
-            isinstance(group.kv_cache_spec, CrossAttentionSpec)
-            for group in kv_cache_config.kv_cache_groups
-        )
 
     def initialize_metadata_builders(
         self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
