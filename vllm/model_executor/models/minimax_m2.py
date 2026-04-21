@@ -258,8 +258,10 @@ class MiniMaxM2DecoderLayer(nn.Module):
                 config.max_position_embeddings, config.max_model_len
             )
         # DecoderLayers are created with `make_layers` which passes the prefix
-        # with the layer's index.
-        layer_idx = int(prefix.split(sep=".")[-1])
+        # with the layer's index. MTP drafts reuse this class with a non-numeric
+        # suffix (e.g. `.mtp_block`); fall back to -1 in that case.
+        last_segment = prefix.split(sep=".")[-1]
+        layer_idx = int(last_segment) if last_segment.isdigit() else -1
 
         self.layer_idx = layer_idx
         self.self_attn = MiniMaxM2Attention(

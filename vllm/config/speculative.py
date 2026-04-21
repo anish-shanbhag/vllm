@@ -45,6 +45,7 @@ MTPModelTypes = Literal[
     "mtp",
     "pangu_ultra_moe_mtp",
     "step3p5_mtp",
+    "minimax_m2_mtp",
 ]
 EagleModelTypes = Literal["eagle", "eagle3", "extract_hidden_states", MTPModelTypes]
 SpeculativeMethod = Literal[
@@ -320,6 +321,13 @@ class SpeculativeConfig:
             hf_config.model_type = "step3p5_mtp"
             n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
             hf_config.update({"n_predict": n_predict, "architectures": ["Step3p5MTP"]})
+
+        if hf_config.model_type == "minimax_m2":
+            hf_config.model_type = "minimax_m2_mtp"
+            n_predict = getattr(hf_config, "num_mtp_modules", 1)
+            hf_config.update(
+                {"n_predict": n_predict, "architectures": ["MiniMaxM2MTP"]}
+            )
 
         if initial_architecture == "MistralLarge3ForCausalLM":
             hf_config.update({"architectures": ["EagleMistralLarge3ForCausalLM"]})
