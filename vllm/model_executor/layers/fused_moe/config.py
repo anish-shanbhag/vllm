@@ -131,6 +131,8 @@ def get_routing_method_type(
     if has_e_score_bias:
         if (num_expert_group or 0) > 0 and scoring_func == "sigmoid":
             return RoutingMethodType.DeepSeekV3
+        elif scoring_func == "sigmoid" and renormalize:
+            return RoutingMethodType.RenormalizeNaive
         else:
             return RoutingMethodType.Unspecified
 
