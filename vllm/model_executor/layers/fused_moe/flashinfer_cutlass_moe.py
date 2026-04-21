@@ -114,7 +114,9 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
 
     @property
     def expects_unquantized_inputs(self) -> bool:
-        return self.quant_config.use_fp8_w8a8 and self.quant_config.is_block_quantized
+        return (
+            self.quant_config.use_fp8_w8a8 and self.quant_config.is_block_quantized
+        ) or self.quant_config.use_nvfp4_w4a4
 
     @staticmethod
     def _supports_current_device() -> bool:
