@@ -45,6 +45,10 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from vllm.model_executor.layers.quantization.fp8 import (
+    Fp8Config,
+    Fp8OnlineLinearMethod,
+)
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     W8A8BlockFp8LinearOp,
@@ -176,10 +180,17 @@ class ModelOptQuantConfigBase(QuantizationConfig):
         if isinstance(layer, (Attention, MLAAttention)):
             return self.KVCacheMethodCls(self)
 
-        # handle exclusion
+        # handle exclusion — use FP8 online quant for excluded linear layers
+        # instead of BF16, since FP8 GEMM has ~2x compute throughput on SM100+
         if self.is_layer_excluded(prefix):
             if isinstance(layer, LinearBase):
-                return UnquantizedLinearMethod()
+                fp8_cfg = Fp8Config(
+                    is_checkpoint_fp8_serialized=False,
+                    activation_scheme="dynamic",
+                    ignored_layers=None,
+                    weight_block_size=None,
+                )
+                return Fp8OnlineLinearMethod(fp8_cfg)
             return None
 
         # TODO: This special hard coded logic is not needed for quantized checkpoints
