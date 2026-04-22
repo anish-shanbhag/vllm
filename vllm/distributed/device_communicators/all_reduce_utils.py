@@ -39,7 +39,7 @@ CUSTOM_ALL_REDUCE_MAX_SIZES = {
         8: MiB // 4,  # 256 KB
     },
     "10.0": {
-        2: 2 * MiB,  # 2 MB
+        2: 4 * MiB,  # 4 MB (raised from 2MB for models with hidden_size=3072 at TP=2)
         4: 4 * MiB,  # 4 MB (raised from 2MB for models with hidden_size=3072 at TP=4)
         6: 1 * MiB,  # 1 MB
         8: 1 * MiB,  # 1 MB
