@@ -229,6 +229,12 @@ class FlashInferAllReduce:
         if len(input_tensor.shape) != 2:
             return False
 
+        # Skip float32 tensors — workspace is created for bf16/fp16 and
+        # the trtllm backend validates use_fp32_lamport matches dtype.
+        # Float32 allreduces (e.g. QK norm) are small; NCCL handles them.
+        if input_tensor.dtype == torch.float32:
+            return False
+
         num_tokens, hidden_dim = input_tensor.shape
         if hidden_dim % 4 != 0:
             return False
