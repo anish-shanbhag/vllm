@@ -681,6 +681,10 @@ class GPUModelRunner(
         # np.repeat / np.cumsum / arange computations.
         self._ones_np = np.ones(self.max_num_reqs, dtype=np.int32)
 
+        # Cached max_seq_len from pure decode fast path to avoid redundant
+        # numpy max in _build_attention_metadata. Set to -1 when invalid.
+        self._pure_decode_max_seq_len: int = -1
+
         # Layer pairings for cross-layer KV sharing.
         # If an Attention layer `layer_name` is in the keys of this dict, it
         # means this layer will perform attention using the keys and values
@@ -865,11 +869,13 @@ class GPUModelRunner(
             )
         return self._mamba_copy_bufs
 
-    def _init_model_kwargs(self):
-        model_kwargs = dict[str, Any]()
+    _EMPTY_MODEL_KWARGS: dict[str, Any] = {}
 
+    def _init_model_kwargs(self):
         if not self.is_pooling_model:
-            return model_kwargs
+            return self._EMPTY_MODEL_KWARGS
+
+        model_kwargs = dict[str, Any]()
 
         num_reqs = self.input_batch.num_reqs
         pooling_params = self.input_batch.get_pooling_params()
@@ -1625,6 +1631,7 @@ class GPUModelRunner(
             self.seq_lens.np[:num_reqs] = num_computed + 1
             self.seq_lens.np[num_reqs:].fill(0)
             self.seq_lens.copy_to_gpu()
+            self._pure_decode_max_seq_len = int(num_computed[:num_reqs].max()) + 1
 
             # In pure decode, all requests are past their prompt tokens,
             # so discard_request_mask is all False (no discards).
@@ -1657,6 +1664,7 @@ class GPUModelRunner(
                 self.positions.copy_to_gpu(num_reqs)
 
         else:
+            self._pure_decode_max_seq_len = -1
             # ---- Original path for mixed prefill/decode batches ----
             # Get request indices.
             # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
@@ -1886,6 +1894,8 @@ class GPUModelRunner(
             # to make sure the backend see a max_seq_len that is larger to the sliding
             # window size when capturing to make sure the correct kernel is selected.
             max_seq_len = self.max_model_len
+        elif self._pure_decode_max_seq_len > 0:
+            max_seq_len = self._pure_decode_max_seq_len
         else:
             max_seq_len = self.seq_lens.np[:num_reqs].max().item()
 
@@ -3170,10 +3180,10 @@ class GPUModelRunner(
                 and len(discard_sampled_tokens_req_indices) == 0):
             starts = self.input_batch.num_tokens_no_spec[:num_sampled_tokens]
             row_idx = self.arange_np[:num_sampled_tokens]
-            flat_toks = np.array(
-                [valid_sampled_token_ids[i][0]
-                 for i in range(num_sampled_tokens)],
-                dtype=self.input_batch.token_ids_cpu.dtype)
+            pinned_np = self.sampled_token_ids_pinned_cpu[
+                :num_sampled_tokens, 0].numpy()
+            flat_toks = pinned_np.astype(
+                self.input_batch.token_ids_cpu.dtype, copy=False)
             self.input_batch.token_ids_cpu[row_idx, starts] = flat_toks
             self.input_batch.is_token_ids[row_idx, starts] = True
             self.input_batch.num_tokens_no_spec[:num_sampled_tokens] = \
@@ -3215,10 +3225,13 @@ class GPUModelRunner(
                 req_state.output_token_ids.extend(sampled_ids)
 
         # Compute prompt logprobs if needed.
-        prompt_logprobs_dict = self._get_prompt_logprobs_dict(
-            hidden_states[:num_scheduled_tokens],
-            scheduler_output.num_scheduled_tokens,
-        )
+        if self.num_prompt_logprobs:
+            prompt_logprobs_dict = self._get_prompt_logprobs_dict(
+                hidden_states[:num_scheduled_tokens],
+                scheduler_output.num_scheduled_tokens,
+            )
+        else:
+            prompt_logprobs_dict = {}
 
         return (
             num_nans_in_logits,
