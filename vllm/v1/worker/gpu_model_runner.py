@@ -3104,10 +3104,13 @@ class GPUModelRunner(
             if gen is not None:
                 gen.set_offset(gen.get_offset() - 4)
 
-        # Copy some objects so they don't get modified after returning.
-        # This is important when using async scheduling.
-        req_ids_output_copy = self.input_batch.req_ids.copy()
-        req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
+        if self.use_async_scheduling:
+            req_ids_output_copy = self.input_batch.req_ids.copy()
+            req_id_to_index_output_copy = \
+                self.input_batch.req_id_to_index.copy()
+        else:
+            req_ids_output_copy = self.input_batch.req_ids
+            req_id_to_index_output_copy = self.input_batch.req_id_to_index
 
         num_sampled_tokens = sampler_output.sampled_token_ids.shape[0]
         sampled_token_ids = sampler_output.sampled_token_ids
