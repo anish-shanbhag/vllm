@@ -3154,32 +3154,58 @@ class GPUModelRunner(
         # the sampled tokens back, because there's no direct communication
         # between the first-stage worker and the last-stage worker.
         req_ids = self.input_batch.req_ids
-        for req_idx in range(num_sampled_tokens):
-            if self.use_async_scheduling:
-                sampled_ids = [-1] if req_idx not in invalid_req_indices_set else None
-            else:
-                sampled_ids = valid_sampled_token_ids[req_idx]
 
-            num_sampled_ids: int = len(sampled_ids) if sampled_ids else 0
+        # Vectorized fast path: sync scheduling, single token per request,
+        # no discards. Uses numpy fancy indexing instead of a Python loop.
+        if (not self.use_async_scheduling
+                and num_sampled_tokens > 0
+                and sampled_token_ids.shape[-1] == 1
+                and len(discard_sampled_tokens_req_indices) == 0):
+            starts = self.input_batch.num_tokens_no_spec[:num_sampled_tokens]
+            row_idx = self.arange_np[:num_sampled_tokens]
+            flat_toks = np.array(
+                [valid_sampled_token_ids[i][0]
+                 for i in range(num_sampled_tokens)],
+                dtype=self.input_batch.token_ids_cpu.dtype)
+            self.input_batch.token_ids_cpu[row_idx, starts] = flat_toks
+            self.input_batch.is_token_ids[row_idx, starts] = True
+            self.input_batch.num_tokens_no_spec[:num_sampled_tokens] = \
+                starts + 1
+            for req_idx in range(num_sampled_tokens):
+                self.requests[req_ids[req_idx]].output_token_ids.append(
+                    int(flat_toks[req_idx]))
+        else:
+            for req_idx in range(num_sampled_tokens):
+                if self.use_async_scheduling:
+                    sampled_ids = ([-1]
+                                   if req_idx not in invalid_req_indices_set
+                                   else None)
+                else:
+                    sampled_ids = valid_sampled_token_ids[req_idx]
 
-            if not sampled_ids:
-                continue
+                num_sampled_ids: int = (len(sampled_ids)
+                                        if sampled_ids else 0)
 
-            start_idx = self.input_batch.num_tokens_no_spec[req_idx]
-            end_idx = start_idx + num_sampled_ids
-            assert end_idx <= self.max_model_len, (
-                "Sampled token IDs exceed the max model length. "
-                f"Total number of tokens: {end_idx} > max_model_len: "
-                f"{self.max_model_len}"
-            )
+                if not sampled_ids:
+                    continue
 
-            self.input_batch.token_ids_cpu[req_idx, start_idx:end_idx] = sampled_ids
-            self.input_batch.is_token_ids[req_idx, start_idx:end_idx] = True
-            self.input_batch.num_tokens_no_spec[req_idx] = end_idx
+                start_idx = self.input_batch.num_tokens_no_spec[req_idx]
+                end_idx = start_idx + num_sampled_ids
+                assert end_idx <= self.max_model_len, (
+                    "Sampled token IDs exceed the max model length. "
+                    f"Total number of tokens: {end_idx} > max_model_len: "
+                    f"{self.max_model_len}"
+                )
 
-            req_id = req_ids[req_idx]
-            req_state = self.requests[req_id]
-            req_state.output_token_ids.extend(sampled_ids)
+                self.input_batch.token_ids_cpu[
+                    req_idx, start_idx:end_idx] = sampled_ids
+                self.input_batch.is_token_ids[
+                    req_idx, start_idx:end_idx] = True
+                self.input_batch.num_tokens_no_spec[req_idx] = end_idx
+
+                req_id = req_ids[req_idx]
+                req_state = self.requests[req_id]
+                req_state.output_token_ids.extend(sampled_ids)
 
         # Compute prompt logprobs if needed.
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
