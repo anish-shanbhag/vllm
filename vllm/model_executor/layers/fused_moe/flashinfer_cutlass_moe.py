@@ -32,6 +32,20 @@ from vllm.utils.flashinfer import (
 
 logger = init_logger(__name__)
 
+_ACTIVATION_TYPE_MAP: dict[MoEActivation, object] | None = None
+
+
+def _get_activation_type_map() -> dict[MoEActivation, object]:
+    global _ACTIVATION_TYPE_MAP
+    if _ACTIVATION_TYPE_MAP is None:
+        from flashinfer.fused_moe.core import ActivationType
+        _ACTIVATION_TYPE_MAP = {
+            MoEActivation.SILU: ActivationType.Swiglu,
+            MoEActivation.SWIGLUOAI: ActivationType.Swiglu,
+            MoEActivation.RELU2_NO_MUL: ActivationType.Relu2,
+        }
+    return _ACTIVATION_TYPE_MAP
+
 
 def is_valid_flashinfer_cutlass_fused_moe(
     hidden_states: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor
@@ -92,6 +106,12 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         self.max_capture_size = (
             get_current_vllm_config().compilation_config.max_cudagraph_capture_size
         )
+
+        self._cached_w1_scale_int32: torch.Tensor | None = None
+        self._cached_w2_scale_int32: torch.Tensor | None = None
+        self._cached_nvfp4_quant_scales: list[torch.Tensor] | None = None
+        self._cached_w1_long: torch.Tensor | None = None
+        self._cached_w2_long: torch.Tensor | None = None
 
         if quant_config.weight_quant_dtype == "mxfp4":
             # This value is used specifically for gpt-oss,
@@ -260,15 +280,9 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool | None,
     ):
-        from flashinfer.fused_moe.core import ActivationType
-
-        activation_str_to_value_map = {
-            MoEActivation.SILU: ActivationType.Swiglu,  # This is the default
-            MoEActivation.SWIGLUOAI: ActivationType.Swiglu,  # gpt-oss alias
-            MoEActivation.RELU2_NO_MUL: ActivationType.Relu2,
-        }
-        assert activation in activation_str_to_value_map, (
-            f"{activation=} missing from {activation_str_to_value_map.keys()=}"
+        activation_type_map = _get_activation_type_map()
+        assert activation in activation_type_map, (
+            f"{activation=} missing from {activation_type_map.keys()=}"
         )
 
         quant_scales = None
@@ -298,23 +312,26 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             fc1_expert_weights = w1
             fc2_expert_weights = w2
         elif self.quant_dtype == "nvfp4":
-            # Ensure w1_scale and w2_scale are not None before calling view
-            assert self.w1_scale is not None and self.w2_scale is not None, (
-                "w1_scale and w2_scale must not be None for FlashInferExperts"
-            )
-            # Flashinfer CUTLASS kernel takes scalar global scales,
-            # min because inv_scale.
-            quant_scales = [
-                self.a1_gscale,
-                self.w1_scale.view(torch.int32),
-                self.g1_alphas,
-                self.a2_gscale,
-                self.w2_scale.view(torch.int32),
-                self.g2_alphas,
-            ]
-            # FlashInfer API requires weight to be long for nvfp4
-            fc1_expert_weights = w1.view(torch.long)
-            fc2_expert_weights = w2.view(torch.long)
+            if self._cached_nvfp4_quant_scales is None:
+                assert self.w1_scale is not None and self.w2_scale is not None, (
+                    "w1_scale and w2_scale must not be None for FlashInferExperts"
+                )
+                self._cached_w1_scale_int32 = self.w1_scale.view(torch.int32)
+                self._cached_w2_scale_int32 = self.w2_scale.view(torch.int32)
+                self._cached_nvfp4_quant_scales = [
+                    self.a1_gscale,
+                    self._cached_w1_scale_int32,
+                    self.g1_alphas,
+                    self.a2_gscale,
+                    self._cached_w2_scale_int32,
+                    self.g2_alphas,
+                ]
+            quant_scales = self._cached_nvfp4_quant_scales
+            if self._cached_w1_long is None or self._cached_w1_long.data_ptr() != w1.data_ptr():
+                self._cached_w1_long = w1.view(torch.long)
+                self._cached_w2_long = w2.view(torch.long)
+            fc1_expert_weights = self._cached_w1_long
+            fc2_expert_weights = self._cached_w2_long
         elif self.weight_quant_dtype == "mxfp4":
             assert self.w1_scale is not None and self.w2_scale is not None
             assert w1.is_contiguous() and w2.is_contiguous()
@@ -386,7 +403,7 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             tp_rank=self.tp_rank,
             ep_size=self.ep_size,
             ep_rank=self.ep_rank,
-            activation_type=activation_str_to_value_map[activation],
+            activation_type=activation_type_map[activation],
             # Informs FlashInfer to use the block-scale decoding path when True
             use_deepseek_fp8_block_scale=self.use_deepseek_fp8_block_scale,
             use_mxfp8_act_scaling=use_mxfp8_act_scaling,
