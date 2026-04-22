@@ -65,11 +65,16 @@ class MiniMaxText01RMSNormTP(CustomOp):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
+        if not self.needs_allreduce:
+            from vllm._custom_ops import rms_norm
+            out = torch.empty_like(x)
+            rms_norm(out, x, self.weight, self.variance_epsilon)
+            return out
+
         orig_dtype = x.dtype
         x = x.to(torch.float32)
         variance = x.pow(2).mean(dim=-1, keepdim=True, dtype=torch.float32)
-        if self.needs_allreduce:
-            variance = tensor_model_parallel_all_reduce(variance) / self.tp_world
+        variance = tensor_model_parallel_all_reduce(variance) / self.tp_world
         x = x * torch.rsqrt(variance + self.variance_epsilon)
         x = (x * self.weight).to(orig_dtype)
         return x
@@ -89,20 +94,27 @@ class MiniMaxText01RMSNormTP(CustomOp):
         q: torch.Tensor,
         k: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not q_norm.needs_allreduce:
+            from vllm._custom_ops import rms_norm
+            q_out = torch.empty_like(q)
+            k_out = torch.empty_like(k)
+            rms_norm(q_out, q, q_norm.weight, q_norm.variance_epsilon)
+            rms_norm(k_out, k, k_norm.weight, k_norm.variance_epsilon)
+            return q_out, k_out
+
         orig_dtype = q.dtype
         q_fp32 = q.to(torch.float32)
         k_fp32 = k.to(torch.float32)
         q_var = q_fp32.pow(2).mean(dim=-1, keepdim=True)
         k_var = k_fp32.pow(2).mean(dim=-1, keepdim=True)
-        if q_norm.needs_allreduce:
-            qk_var = torch.empty(
-                (q_var.shape[0], 2), device=q.device, dtype=torch.float32
-            )
-            qk_var[:, 0:1] = q_var
-            qk_var[:, 1:2] = k_var
-            qk_var = tensor_model_parallel_all_reduce(qk_var) / q_norm.tp_world
-            q_var = qk_var[:, 0:1]
-            k_var = qk_var[:, 1:2]
+        qk_var = torch.empty(
+            (q_var.shape[0], 2), device=q.device, dtype=torch.float32
+        )
+        qk_var[:, 0:1] = q_var
+        qk_var[:, 1:2] = k_var
+        qk_var = tensor_model_parallel_all_reduce(qk_var) / q_norm.tp_world
+        q_var = qk_var[:, 0:1]
+        k_var = qk_var[:, 1:2]
         q = (q_fp32 * torch.rsqrt(q_var + q_norm.variance_epsilon)
              * q_norm.weight).to(orig_dtype)
         k = (k_fp32 * torch.rsqrt(k_var + k_norm.variance_epsilon)
