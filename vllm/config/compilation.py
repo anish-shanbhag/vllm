@@ -129,6 +129,8 @@ class PassConfig:
     """Enable async TP."""
     fuse_allreduce_rms: bool = Field(default=None)
     """Enable flashinfer allreduce fusion."""
+    fuse_minimax_qk_norm: bool = Field(default=None)
+    """Enable fused allreduce+RMSNorm for MiniMax QK norm."""
     enable_qk_norm_rope_fusion: bool = False
     """Enable fused Q/K RMSNorm + RoPE pass."""
 
@@ -215,6 +217,7 @@ class PassConfig:
         "enable_sp",
         "fuse_gemm_comms",
         "fuse_allreduce_rms",
+        "fuse_minimax_qk_norm",
         "fuse_act_padding",
         "fuse_rope_kvcache",
         mode="wrap",
