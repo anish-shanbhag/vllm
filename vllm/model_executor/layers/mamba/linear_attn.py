@@ -40,6 +40,10 @@ class MiniMaxText01RMSNormTP(CustomOp):
         super().__init__()
         self.tp_world = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
+        vllm_config = get_current_vllm_config()
+        ep_enabled = (vllm_config.parallel_config.enable_expert_parallel
+                      if vllm_config.parallel_config is not None else False)
+        self.needs_allreduce = self.tp_world > 1 and not ep_enabled
         self.weight = nn.Parameter(torch.ones(int(hidden_size / self.tp_world)))
 
         self.weight.weight_loader = self.weight_loader
@@ -64,7 +68,7 @@ class MiniMaxText01RMSNormTP(CustomOp):
         orig_dtype = x.dtype
         x = x.to(torch.float32)
         variance = x.pow(2).mean(dim=-1, keepdim=True, dtype=torch.float32)
-        if self.tp_world > 1:
+        if self.needs_allreduce:
             variance = tensor_model_parallel_all_reduce(variance) / self.tp_world
         x = x * torch.rsqrt(variance + self.variance_epsilon)
         x = (x * self.weight).to(orig_dtype)
@@ -90,7 +94,7 @@ class MiniMaxText01RMSNormTP(CustomOp):
         k_fp32 = k.to(torch.float32)
         q_var = q_fp32.pow(2).mean(dim=-1, keepdim=True)
         k_var = k_fp32.pow(2).mean(dim=-1, keepdim=True)
-        if q_norm.tp_world > 1:
+        if q_norm.needs_allreduce:
             qk_var = torch.empty(
                 (q_var.shape[0], 2), device=q.device, dtype=torch.float32
             )

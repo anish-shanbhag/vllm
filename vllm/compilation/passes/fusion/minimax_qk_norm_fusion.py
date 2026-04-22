@@ -246,6 +246,13 @@ class MiniMaxQKNormPass(VllmPatternMatcherPass):
             logger.warning_once("MiniMaxQKNormPass disabled: tp_size <= 1.")
             return
 
+        ep_enabled = (config.parallel_config.enable_expert_parallel
+                      if config.parallel_config is not None else False)
+        if ep_enabled:
+            logger.warning_once(
+                "MiniMaxQKNormPass disabled: EP skips QK norm allreduce.")
+            return
+
         if config.model_config is None:
             logger.warning_once("MiniMaxQKNormPass disabled: no model_config.")
             return
