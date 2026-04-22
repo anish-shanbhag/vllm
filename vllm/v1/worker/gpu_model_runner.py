@@ -3661,17 +3661,7 @@ class GPUModelRunner(
                 ubatch_slices_padded,
             )
 
-            # True if any attention backend handles KV cache update separately
-            # from forward() (i.e., forward_includes_kv_cache_update=False). When true,
-            # slot_mappings must use padded dimensions to match the key/value tensors.
-            has_separate_kv_update = not all(
-                all(
-                    g.backend.forward_includes_kv_cache_update
-                    for g in self.attn_groups[id]
-                )
-                for id, spec in enumerate(self.kv_cache_config.kv_cache_groups)
-                if not isinstance(spec.kv_cache_spec, EncoderOnlyAttentionSpec)
-            )
+            has_separate_kv_update = self._has_separate_kv_update
             pad_attn = cudagraph_mode == CUDAGraphMode.FULL
 
             if self.cache_config.mamba_cache_mode == "align":
@@ -6251,6 +6241,15 @@ class GPUModelRunner(
             else:
                 kv_transfer_group.register_kv_caches(kv_caches)
             kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
+
+        self._has_separate_kv_update = not all(
+            all(
+                g.backend.forward_includes_kv_cache_update
+                for g in self.attn_groups[id]
+            )
+            for id, spec in enumerate(kv_cache_config.kv_cache_groups)
+            if not isinstance(spec.kv_cache_spec, EncoderOnlyAttentionSpec)
+        )
 
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
