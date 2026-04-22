@@ -917,6 +917,10 @@ class GPUModelRunner(
         if len(self.kv_cache_config.kv_cache_groups) == 0:
             return
 
+        if (scheduler_output.total_num_scheduled_tokens
+                == self.input_batch.num_reqs):
+            return
+
         if self.reorder_batch_threshold is not None:
             reorder_batch_to_split_decodes_and_prefills(
                 self.input_batch,
