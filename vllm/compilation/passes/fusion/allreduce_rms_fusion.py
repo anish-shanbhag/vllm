@@ -753,6 +753,13 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
             scope="global",
         )
 
+        # MiniMax M2.5 uses FP32 allreduces for QK norm, so workspace must support FP32
+        workspace_dtype = self.model_dtype
+        if config.model_config is not None and config.model_config.hf_config is not None:
+            model_type = getattr(config.model_config.hf_config, "model_type", None)
+            if model_type and "minimax" in model_type.lower():
+                workspace_dtype = torch.float32
+
         for workspace_init_fn in [
             initialize_fi_ar_workspace,
             initialize_fi_ar_quant_workspace,
@@ -763,7 +770,7 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
                     rank=rank,
                     max_token_num=self.max_token_num,
                     hidden_dim=self.hidden_dim,
-                    dtype=self.model_dtype,
+                    dtype=workspace_dtype,
                     group=self.group,
                 )
             except Exception as e:
