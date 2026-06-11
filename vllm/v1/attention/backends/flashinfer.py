@@ -19,6 +19,13 @@ from flashinfer.prefill import trtllm_batch_context_with_kv_cache
 from flashinfer.utils import FP4Tensor
 from typing_extensions import override
 
+try:
+    from flashinfer.gpt_oss_ops import (
+        reshape_and_cache_fp8 as _flashinfer_reshape_and_cache_fp8,
+    )
+except (ImportError, AttributeError):
+    _flashinfer_reshape_and_cache_fp8 = None
+
 from vllm import envs
 from vllm.config import (
     CUDAGraphMode,
@@ -27,6 +34,7 @@ from vllm.config import (
 )
 from vllm.config.cache import CacheDType
 from vllm.distributed.parallel_state import get_dcp_group
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
@@ -85,6 +93,32 @@ logger = init_logger(__name__)
 
 trtllm_gen_workspace_buffer = None
 
+_FLASHINFER_RESHAPE_CACHE_FP8_MAX_TWO_HEAD_TOKENS = 4096
+_FLASHINFER_RESHAPE_CACHE_FP8_MAX_TWO_HEAD_REQS = 32
+_FLASHINFER_RESHAPE_CACHE_FP8_MAX_TWO_HEAD_LARGE_UPDATE_REQS = 8
+
+
+def _skip_flashinfer_reshape_cache_fp8_two_head(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    active_num_reqs: int | None,
+) -> bool:
+    if key.dim() != 3 or value.dim() != 3:
+        return False
+    if key.size(1) != 2 or value.size(1) != 2:
+        return False
+    if (
+        active_num_reqs is None
+        or active_num_reqs > _FLASHINFER_RESHAPE_CACHE_FP8_MAX_TWO_HEAD_REQS
+    ):
+        return True
+    return (
+        slot_mapping.numel() > _FLASHINFER_RESHAPE_CACHE_FP8_MAX_TWO_HEAD_TOKENS
+        and active_num_reqs
+        > _FLASHINFER_RESHAPE_CACHE_FP8_MAX_TWO_HEAD_LARGE_UPDATE_REQS
+    )
+
 
 def _get_trtllm_gen_workspace_buffer():
     global trtllm_gen_workspace_buffer
@@ -93,6 +127,104 @@ def _get_trtllm_gen_workspace_buffer():
             envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE, dtype=torch.uint8, device="cuda"
         )
     return trtllm_gen_workspace_buffer
+
+
+def _try_flashinfer_reshape_and_cache_fp8(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    kv_cache_dtype: str | torch.dtype,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    active_num_reqs: int | None = None,
+) -> bool:
+    if _flashinfer_reshape_and_cache_fp8 is None:
+        return False
+
+    capability = current_platform.get_device_capability()
+    if capability is None or capability.major < 10:
+        return False
+
+    fp8_e4m3 = getattr(torch, "float8_e4m3fn", None)
+    if kv_cache_dtype not in ("fp8", "fp8_e4m3", fp8_e4m3):
+        return False
+    if k_scale is None or v_scale is None:
+        return False
+    if key.dtype != torch.bfloat16 or value.dtype != torch.bfloat16:
+        return False
+    cache_dtypes = (torch.uint8,) if fp8_e4m3 is None else (torch.uint8, fp8_e4m3)
+    if key_cache.dtype not in cache_dtypes or value_cache.dtype not in cache_dtypes:
+        return False
+    if key.dim() != 3 or value.dim() != 3:
+        return False
+    if key_cache.dim() != 4 or value_cache.dim() != 4:
+        return False
+    if slot_mapping.dim() != 1 or slot_mapping.dtype != torch.int64:
+        return False
+    # CUDA graph captures can pad key/value while slot_mapping keeps only
+    # actual tokens. FlashInfer uses slot_mapping length as the launch count.
+    if key.size(0) != value.size(0) or slot_mapping.numel() > key.size(0):
+        return False
+    if key.size(2) != 64 or value.size(2) != 64:
+        return False
+    num_heads = key.size(1)
+    if num_heads <= 0 or value.size(1) != num_heads:
+        return False
+    # Updates with only two local KV heads have limited head-level parallelism.
+    # Keep this specialized path for lower active request counts, where it can
+    # still be profitable, and leave larger batches on the stock cache op.
+    if _skip_flashinfer_reshape_cache_fp8_two_head(
+        key, value, slot_mapping, active_num_reqs
+    ):
+        return False
+    if (
+        key_cache.size(1) != 16
+        or value_cache.size(1) != 16
+        or key_cache.size(2) != num_heads
+        or value_cache.size(2) != num_heads
+        or key_cache.size(3) != 64
+        or value_cache.size(3) != 64
+    ):
+        return False
+    if key.stride(2) != 1 or value.stride(2) != 1:
+        return False
+    if key.stride(1) < 64 or value.stride(1) < 64:
+        return False
+    if key_cache.stride(1) != 64 or value_cache.stride(1) != 64:
+        return False
+    if key_cache.stride(3) != 1 or value_cache.stride(3) != 1:
+        return False
+    if key_cache.stride(2) < 64 or value_cache.stride(2) < 64:
+        return False
+    if k_scale.numel() != 1 or v_scale.numel() != 1:
+        return False
+
+    _flashinfer_reshape_and_cache_fp8(
+        key, value, key_cache, value_cache, slot_mapping, k_scale, v_scale
+    )
+    return True
+
+
+def _get_active_num_reqs(layer: torch.nn.Module) -> int | None:
+    if not is_forward_context_available():
+        return None
+    layer_name = getattr(layer, "layer_name", None)
+    if not isinstance(layer_name, str):
+        return None
+    try:
+        attn_metadata = get_forward_context().attn_metadata
+    except AssertionError:
+        return None
+    if isinstance(attn_metadata, dict):
+        layer_metadata = attn_metadata.get(layer_name)
+    elif isinstance(attn_metadata, list):
+        layer_metadata = attn_metadata[0].get(layer_name) if attn_metadata else None
+    else:
+        layer_metadata = attn_metadata
+    num_reqs = getattr(layer_metadata, "num_reqs", None)
+    return num_reqs if isinstance(num_reqs, int) else None
 
 
 @triton.jit
@@ -1848,16 +1980,42 @@ class FlashInferImpl(AttentionImpl):
             # actual tokens.
             k_cache = kv_cache[:, 0]
             v_cache = kv_cache[:, 1]
-            torch.ops._C_cache_ops.reshape_and_cache_flash(
-                key,
-                value,
-                k_cache,
-                v_cache,
-                slot_mapping,
-                self.kv_cache_dtype,
-                layer._k_scale,
-                layer._v_scale,
+            active_num_reqs = None
+            if (
+                key.dim() == 3
+                and value.dim() == 3
+                and key.size(1) == 2
+                and value.size(1) == 2
+            ):
+                active_num_reqs = _get_active_num_reqs(layer)
+            skip_flashinfer_cache_update = _skip_flashinfer_reshape_cache_fp8_two_head(
+                key, value, slot_mapping, active_num_reqs
             )
+            use_stock_cache_update = (
+                skip_flashinfer_cache_update
+                or not _try_flashinfer_reshape_and_cache_fp8(
+                    key,
+                    value,
+                    k_cache,
+                    v_cache,
+                    slot_mapping,
+                    self.kv_cache_dtype,
+                    layer._k_scale,
+                    layer._v_scale,
+                    active_num_reqs,
+                )
+            )
+            if use_stock_cache_update:
+                torch.ops._C_cache_ops.reshape_and_cache_flash(
+                    key,
+                    value,
+                    k_cache,
+                    v_cache,
+                    slot_mapping,
+                    self.kv_cache_dtype,
+                    layer._k_scale,
+                    layer._v_scale,
+                )
 
 
 def fast_plan_decode(

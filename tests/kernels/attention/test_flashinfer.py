@@ -26,6 +26,278 @@ SOFT_CAPS = [None, 30.0]
 SLIDING_WINDOWS = [None, 64]
 
 
+def test_try_flashinfer_reshape_cache_fp8_accepts_padded_cuda_graph_inputs(
+    monkeypatch,
+):
+    from vllm.platforms.interface import DeviceCapability
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    calls = []
+
+    def fake_reshape_and_cache_fp8(*args):
+        calls.append(args)
+
+    monkeypatch.setattr(
+        flashinfer_backend,
+        "_flashinfer_reshape_and_cache_fp8",
+        fake_reshape_and_cache_fp8,
+    )
+    monkeypatch.setattr(
+        flashinfer_backend.current_platform,
+        "get_device_capability",
+        lambda: DeviceCapability(major=10, minor=0),
+    )
+
+    key = torch.empty((8, 1, 64), dtype=torch.bfloat16)
+    value = torch.empty((8, 1, 64), dtype=torch.bfloat16)
+    key_cache = torch.empty((1, 16, 1, 64), dtype=torch.uint8)
+    value_cache = torch.empty((1, 16, 1, 64), dtype=torch.uint8)
+    slot_mapping = torch.arange(5, dtype=torch.int64)
+    k_scale = torch.ones(1, dtype=torch.float32)
+    v_scale = torch.ones(1, dtype=torch.float32)
+
+    assert flashinfer_backend._try_flashinfer_reshape_and_cache_fp8(
+        key,
+        value,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        "fp8",
+        k_scale,
+        v_scale,
+    )
+    assert len(calls) == 1
+    assert calls[0][4] is slot_mapping
+
+
+def test_try_flashinfer_reshape_cache_fp8_skips_two_head_without_batch_metadata(
+    monkeypatch,
+):
+    from vllm.platforms.interface import DeviceCapability
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    calls = []
+
+    def fake_reshape_and_cache_fp8(*args):
+        calls.append(args)
+
+    monkeypatch.setattr(
+        flashinfer_backend,
+        "_flashinfer_reshape_and_cache_fp8",
+        fake_reshape_and_cache_fp8,
+    )
+    monkeypatch.setattr(
+        flashinfer_backend.current_platform,
+        "get_device_capability",
+        lambda: DeviceCapability(major=10, minor=0),
+    )
+
+    num_tokens = 64
+    key = torch.empty((num_tokens, 2, 64), dtype=torch.bfloat16)
+    value = torch.empty((num_tokens, 2, 64), dtype=torch.bfloat16)
+    key_cache = torch.empty((1, 16, 2, 64), dtype=torch.uint8)
+    value_cache = torch.empty((1, 16, 2, 64), dtype=torch.uint8)
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int64)
+    k_scale = torch.ones(1, dtype=torch.float32)
+    v_scale = torch.ones(1, dtype=torch.float32)
+
+    assert not flashinfer_backend._try_flashinfer_reshape_and_cache_fp8(
+        key,
+        value,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        "fp8",
+        k_scale,
+        v_scale,
+    )
+    assert not calls
+
+
+def test_try_flashinfer_reshape_cache_fp8_accepts_large_four_head_updates(
+    monkeypatch,
+):
+    from vllm.platforms.interface import DeviceCapability
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    calls = []
+
+    def fake_reshape_and_cache_fp8(*args):
+        calls.append(args)
+
+    monkeypatch.setattr(
+        flashinfer_backend,
+        "_flashinfer_reshape_and_cache_fp8",
+        fake_reshape_and_cache_fp8,
+    )
+    monkeypatch.setattr(
+        flashinfer_backend.current_platform,
+        "get_device_capability",
+        lambda: DeviceCapability(major=10, minor=0),
+    )
+
+    num_tokens = 8192
+    key = torch.empty((num_tokens, 4, 64), dtype=torch.bfloat16)
+    value = torch.empty((num_tokens, 4, 64), dtype=torch.bfloat16)
+    key_cache = torch.empty((1, 16, 4, 64), dtype=torch.uint8)
+    value_cache = torch.empty((1, 16, 4, 64), dtype=torch.uint8)
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int64)
+    k_scale = torch.ones(1, dtype=torch.float32)
+    v_scale = torch.ones(1, dtype=torch.float32)
+
+    assert flashinfer_backend._try_flashinfer_reshape_and_cache_fp8(
+        key,
+        value,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        "fp8",
+        k_scale,
+        v_scale,
+    )
+    assert len(calls) == 1
+
+
+def test_try_flashinfer_reshape_cache_fp8_accepts_large_two_head_low_batch(
+    monkeypatch,
+):
+    from vllm.platforms.interface import DeviceCapability
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    calls = []
+
+    def fake_reshape_and_cache_fp8(*args):
+        calls.append(args)
+
+    monkeypatch.setattr(
+        flashinfer_backend,
+        "_flashinfer_reshape_and_cache_fp8",
+        fake_reshape_and_cache_fp8,
+    )
+    monkeypatch.setattr(
+        flashinfer_backend.current_platform,
+        "get_device_capability",
+        lambda: DeviceCapability(major=10, minor=0),
+    )
+
+    num_tokens = 8192
+    key = torch.empty((num_tokens, 2, 64), dtype=torch.bfloat16)
+    value = torch.empty((num_tokens, 2, 64), dtype=torch.bfloat16)
+    key_cache = torch.empty((1, 16, 2, 64), dtype=torch.uint8)
+    value_cache = torch.empty((1, 16, 2, 64), dtype=torch.uint8)
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int64)
+    k_scale = torch.ones(1, dtype=torch.float32)
+    v_scale = torch.ones(1, dtype=torch.float32)
+    large_update_reqs = (
+        flashinfer_backend._FLASHINFER_RESHAPE_CACHE_FP8_MAX_TWO_HEAD_LARGE_UPDATE_REQS
+    )
+
+    assert flashinfer_backend._try_flashinfer_reshape_and_cache_fp8(
+        key,
+        value,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        "fp8",
+        k_scale,
+        v_scale,
+        active_num_reqs=large_update_reqs,
+    )
+    assert len(calls) == 1
+
+
+def test_try_flashinfer_reshape_cache_fp8_accepts_small_two_head_mid_batch(
+    monkeypatch,
+):
+    from vllm.platforms.interface import DeviceCapability
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    calls = []
+
+    def fake_reshape_and_cache_fp8(*args):
+        calls.append(args)
+
+    monkeypatch.setattr(
+        flashinfer_backend,
+        "_flashinfer_reshape_and_cache_fp8",
+        fake_reshape_and_cache_fp8,
+    )
+    monkeypatch.setattr(
+        flashinfer_backend.current_platform,
+        "get_device_capability",
+        lambda: DeviceCapability(major=10, minor=0),
+    )
+
+    key = torch.empty((64, 2, 64), dtype=torch.bfloat16)
+    value = torch.empty((64, 2, 64), dtype=torch.bfloat16)
+    key_cache = torch.empty((1, 16, 2, 64), dtype=torch.uint8)
+    value_cache = torch.empty((1, 16, 2, 64), dtype=torch.uint8)
+    slot_mapping = torch.arange(64, dtype=torch.int64)
+    k_scale = torch.ones(1, dtype=torch.float32)
+    v_scale = torch.ones(1, dtype=torch.float32)
+
+    assert flashinfer_backend._try_flashinfer_reshape_and_cache_fp8(
+        key,
+        value,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        "fp8",
+        k_scale,
+        v_scale,
+        active_num_reqs=(
+            flashinfer_backend._FLASHINFER_RESHAPE_CACHE_FP8_MAX_TWO_HEAD_REQS
+        ),
+    )
+    assert len(calls) == 1
+
+
+def test_try_flashinfer_reshape_cache_fp8_skips_two_head_high_batch(
+    monkeypatch,
+):
+    from vllm.platforms.interface import DeviceCapability
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    calls = []
+
+    def fake_reshape_and_cache_fp8(*args):
+        calls.append(args)
+
+    monkeypatch.setattr(
+        flashinfer_backend,
+        "_flashinfer_reshape_and_cache_fp8",
+        fake_reshape_and_cache_fp8,
+    )
+    monkeypatch.setattr(
+        flashinfer_backend.current_platform,
+        "get_device_capability",
+        lambda: DeviceCapability(major=10, minor=0),
+    )
+
+    key = torch.empty((64, 2, 64), dtype=torch.bfloat16)
+    value = torch.empty((64, 2, 64), dtype=torch.bfloat16)
+    key_cache = torch.empty((1, 16, 2, 64), dtype=torch.uint8)
+    value_cache = torch.empty((1, 16, 2, 64), dtype=torch.uint8)
+    slot_mapping = torch.arange(64, dtype=torch.int64)
+    k_scale = torch.ones(1, dtype=torch.float32)
+    v_scale = torch.ones(1, dtype=torch.float32)
+
+    assert not flashinfer_backend._try_flashinfer_reshape_and_cache_fp8(
+        key,
+        value,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        "fp8",
+        k_scale,
+        v_scale,
+        active_num_reqs=(
+            flashinfer_backend._FLASHINFER_RESHAPE_CACHE_FP8_MAX_TWO_HEAD_REQS + 1
+        ),
+    )
+    assert not calls
+
+
 def ref_paged_attn(
     query: torch.Tensor,
     key_cache: torch.Tensor,
